@@ -43,6 +43,11 @@ impl HistoryStore {
         // upgraded mid-flight (which busy_timeout does not retry).
         conn.set_transaction_behavior(rusqlite::TransactionBehavior::Immediate);
         conn.busy_timeout(Duration::from_secs(5)).map_err(io::Error::other)?;
+        // Must be set before the database file is initialized (the WAL
+        // switch below writes the header, baking the vacuum mode in); a
+        // no-op on DBs that already have tables. Lets the file shrink
+        // after large images churn.
+        conn.pragma_update(None, "auto_vacuum", "INCREMENTAL").map_err(io::Error::other)?;
         conn.pragma_update(None, "journal_mode", "WAL").map_err(io::Error::other)?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS entries (
@@ -108,6 +113,7 @@ impl HistoryStore {
         let appended =
             Self::append_text_in(&tx, text, ts, self.max_entries, self.max_entry_bytes)?;
         tx.commit().map_err(io::Error::other)?;
+        self.reclaim_space();
         Ok(appended)
     }
 
@@ -172,7 +178,19 @@ impl HistoryStore {
         .map_err(io::Error::other)?;
         Self::enforce_cap(&tx, self.max_entries)?;
         tx.commit().map_err(io::Error::other)?;
+        self.reclaim_space();
         Ok(true)
+    }
+
+    /// Best-effort freelist reclamation so the file shrinks after large
+    /// entries are dropped. Must run outside any transaction. NOTE:
+    /// `PRAGMA incremental_vacuum` frees one page per step, so the
+    /// statement has to be stepped to exhaustion — a single execute (or
+    /// rusqlite's `execute_batch`, which steps once) frees only one page.
+    fn reclaim_space(&self) {
+        let Ok(mut stmt) = self.conn.prepare("PRAGMA incremental_vacuum") else { return };
+        let Ok(mut rows) = stmt.query([]) else { return };
+        while let Ok(Some(_)) = rows.next() {}
     }
 
     /// PNG bytes for an image entry; None if the id is gone or not an image.
@@ -188,6 +206,7 @@ impl HistoryStore {
         self.conn
             .execute("DELETE FROM entries WHERE id = ?1", params![id])
             .map_err(io::Error::other)?;
+        self.reclaim_space();
         Ok(())
     }
 
@@ -259,6 +278,14 @@ mod tests {
     fn load_returns_empty_when_no_db() {
         let dir = tempfile::tempdir().unwrap();
         assert!(store(dir.path()).load().is_empty());
+    }
+
+    #[test]
+    fn fresh_db_uses_incremental_auto_vacuum() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let mode: i64 = s.conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0)).unwrap();
+        assert_eq!(mode, 2, "2 = INCREMENTAL");
     }
 
     #[test]
