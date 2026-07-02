@@ -7,11 +7,17 @@ pub struct Config {
     pub max_entries: usize,
     pub max_entry_bytes: usize,
     pub poll_ms: u64,
+    pub max_image_bytes: usize,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { max_entries: 50, max_entry_bytes: 256 * 1024, poll_ms: 500 }
+        Self {
+            max_entries: 50,
+            max_entry_bytes: 256 * 1024,
+            poll_ms: 500,
+            max_image_bytes: 5 * 1024 * 1024,
+        }
     }
 }
 
@@ -30,6 +36,7 @@ impl Config {
         if c.max_entries == 0 { c.max_entries = d.max_entries; }
         if c.max_entry_bytes == 0 { c.max_entry_bytes = d.max_entry_bytes; }
         if c.poll_ms == 0 { c.poll_ms = d.poll_ms; }
+        if c.max_image_bytes == 0 { c.max_image_bytes = d.max_image_bytes; }
         c
     }
 }
@@ -44,6 +51,7 @@ mod tests {
         assert_eq!(c.max_entries, 50);
         assert_eq!(c.max_entry_bytes, 256 * 1024);
         assert_eq!(c.poll_ms, 500);
+        assert_eq!(c.max_image_bytes, 5 * 1024 * 1024);
     }
 
     #[test]
@@ -69,7 +77,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("config.toml"),
-            "max_entries = 0\nmax_entry_bytes = 0\npoll_ms = 0\n",
+            "max_entries = 0\nmax_entry_bytes = 0\npoll_ms = 0\nmax_image_bytes = 0\n",
         )
         .unwrap();
         assert_eq!(Config::load(Some(dir.path())), Config::default());
