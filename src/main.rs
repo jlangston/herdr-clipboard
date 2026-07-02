@@ -1,3 +1,4 @@
+mod config;
 mod filter;
 mod history;
 mod paths;
