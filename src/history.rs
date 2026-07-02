@@ -257,7 +257,11 @@ impl HistoryStore {
                 ts: u64,
                 text: String,
             }
-            let contents = fs::read_to_string(&jsonl)?;
+            // Lossy read: v1 tolerated invalid-UTF-8 lines (they fail the
+            // serde parse below and are skipped); a strict read would make
+            // one bad byte abort the whole migration on every open.
+            let raw = fs::read(&jsonl)?;
+            let contents = String::from_utf8_lossy(&raw);
             let tx = self.conn.unchecked_transaction().map_err(io::Error::other)?;
             for line in contents.lines() {
                 let Ok(e) = serde_json::from_str::<LegacyEntry>(line) else { continue };
@@ -462,6 +466,21 @@ mod tests {
         // Reopening must not re-import from the .bak
         s.append_text("new", 3).unwrap();
         assert_eq!(texts(&store(dir.path())), vec!["new", "old b", "old a"]);
+    }
+
+    #[test]
+    fn migration_tolerates_invalid_utf8_lines() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(b"{\"ts\":1,\"text\":\"older\"}\n").unwrap();
+        f.write_all(&[0xff, 0xfe, b'\n']).unwrap();
+        f.write_all(b"{\"ts\":2,\"text\":\"newer\"}\n").unwrap();
+        drop(f);
+        let s = store(dir.path());
+        assert_eq!(texts(&s), vec!["newer", "older"], "bad line skipped, rest migrated");
+        assert!(dir.path().join("history.jsonl.bak").exists());
     }
 
     #[test]
