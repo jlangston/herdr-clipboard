@@ -104,10 +104,25 @@ impl HistoryStore {
     /// Store text as the newest entry. Returns false when skipped
     /// (empty, oversized, or identical to the current newest entry).
     pub fn append_text(&self, text: &str, ts: u64) -> io::Result<bool> {
-        if text.is_empty() || text.len() > self.max_entry_bytes {
+        let tx = self.conn.unchecked_transaction().map_err(io::Error::other)?;
+        let appended =
+            Self::append_text_in(&tx, text, ts, self.max_entries, self.max_entry_bytes)?;
+        tx.commit().map_err(io::Error::other)?;
+        Ok(appended)
+    }
+
+    /// `append_text`'s body against a caller-owned transaction, so the
+    /// migration can batch many appends into one atomic commit.
+    fn append_text_in(
+        tx: &rusqlite::Transaction,
+        text: &str,
+        ts: u64,
+        max_entries: usize,
+        max_entry_bytes: usize,
+    ) -> io::Result<bool> {
+        if text.is_empty() || text.len() > max_entry_bytes {
             return Ok(false);
         }
-        let tx = self.conn.unchecked_transaction().map_err(io::Error::other)?;
         let newest: Option<(String, Option<String>)> = tx
             .query_row(
                 "SELECT kind, text FROM entries ORDER BY id DESC LIMIT 1",
@@ -117,7 +132,7 @@ impl HistoryStore {
             .optional()
             .map_err(io::Error::other)?;
         if matches!(&newest, Some((k, Some(t))) if k == "text" && t == text) {
-            return Ok(false); // tx drops → rollback (no writes yet anyway)
+            return Ok(false);
         }
         tx.execute("DELETE FROM entries WHERE kind = 'text' AND text = ?1", params![text])
             .map_err(io::Error::other)?;
@@ -126,8 +141,7 @@ impl HistoryStore {
             params![ts as i64, text],
         )
         .map_err(io::Error::other)?;
-        Self::enforce_cap(&tx, self.max_entries)?;
-        tx.commit().map_err(io::Error::other)?;
+        Self::enforce_cap(tx, max_entries)?;
         Ok(true)
     }
 
@@ -191,6 +205,11 @@ impl HistoryStore {
     /// One-shot import of v1's history.jsonl: only when the DB is empty and
     /// the file exists; the file is renamed to .bak afterwards so it never
     /// re-imports. Corrupt lines are skipped, matching v1's load behavior.
+    /// The import is a single transaction and the rename happens only after
+    /// it commits: a crash mid-import rolls back to an empty DB with the
+    /// jsonl intact, so the next open retries cleanly instead of the
+    /// `count == 0` guard stranding the unimported remainder in a retired
+    /// .bak file.
     fn migrate_v1_jsonl(&self, state_dir: &Path) -> io::Result<()> {
         let jsonl = state_dir.join("history.jsonl");
         if !jsonl.exists() {
@@ -206,10 +225,13 @@ impl HistoryStore {
                 ts: u64,
                 text: String,
             }
-            for line in fs::read_to_string(&jsonl)?.lines() {
+            let contents = fs::read_to_string(&jsonl)?;
+            let tx = self.conn.unchecked_transaction().map_err(io::Error::other)?;
+            for line in contents.lines() {
                 let Ok(e) = serde_json::from_str::<LegacyEntry>(line) else { continue };
-                self.append_text(&e.text, e.ts)?;
+                Self::append_text_in(&tx, &e.text, e.ts, self.max_entries, self.max_entry_bytes)?;
             }
+            tx.commit().map_err(io::Error::other)?;
         }
         fs::rename(&jsonl, state_dir.join("history.jsonl.bak"))
     }
@@ -395,5 +417,20 @@ mod tests {
         store(dir.path()).append_text("existing", 1).unwrap();
         std::fs::write(dir.path().join("history.jsonl"), "{\"ts\":9,\"text\":\"stale\"}\n").unwrap();
         assert_eq!(texts(&store(dir.path())), vec!["existing"]);
+    }
+
+    #[test]
+    fn migration_is_all_or_nothing_wrt_rename() {
+        // If the jsonl is present and the DB is empty, after open: ALL valid
+        // lines are in the DB and the jsonl is retired. This pins the
+        // single-transaction contract indirectly: no code path may rename
+        // before the import transaction commits.
+        let dir = tempfile::tempdir().unwrap();
+        let lines: Vec<String> =
+            (0..200).map(|i| format!("{{\"ts\":{i},\"text\":\"entry {i}\"}}")).collect();
+        std::fs::write(dir.path().join("history.jsonl"), lines.join("\n")).unwrap();
+        let s = HistoryStore::new(dir.path(), 500, 1024, 1024).unwrap();
+        assert_eq!(s.load().len(), 200);
+        assert!(!dir.path().join("history.jsonl").exists());
     }
 }
