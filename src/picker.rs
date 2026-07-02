@@ -1,0 +1,239 @@
+use crate::filter::fuzzy_match;
+use crate::history::Entry;
+
+/// Terminal-agnostic key model so state transitions test without a TTY.
+pub enum Key {
+    Up,
+    Down,
+    Enter,
+    Esc,
+    Backspace,
+    DeleteEntry,
+    Char(char),
+}
+
+#[derive(Debug, PartialEq)]
+pub enum Outcome {
+    Continue,
+    Cancel,
+    /// Final text to send (trailing newline already stripped).
+    Paste(String),
+    /// Entry with this ts was removed from the state; persist the delete.
+    Delete(u64),
+}
+
+pub struct PickerState {
+    entries: Vec<Entry>, // newest first
+    pub filter: String,
+    pub selected: usize, // index into visible()
+    pub pending_confirm: bool,
+    pub status: Option<String>,
+}
+
+impl PickerState {
+    pub fn new(entries: Vec<Entry>) -> Self {
+        Self { entries, filter: String::new(), selected: 0, pending_confirm: false, status: None }
+    }
+
+    /// Filtered view, history order preserved (newest first).
+    pub fn visible(&self) -> Vec<&Entry> {
+        self.entries.iter().filter(|e| fuzzy_match(&self.filter, &e.text)).collect()
+    }
+
+    pub fn selected_entry(&self) -> Option<&Entry> {
+        self.visible().get(self.selected).copied()
+    }
+
+    pub fn on_key(&mut self, key: Key) -> Outcome {
+        if !matches!(key, Key::Enter) {
+            self.pending_confirm = false;
+            self.status = None;
+        }
+        match key {
+            Key::Up => {
+                self.selected = self.selected.saturating_sub(1);
+                Outcome::Continue
+            }
+            Key::Down => {
+                let len = self.visible().len();
+                if len > 0 && self.selected < len - 1 {
+                    self.selected += 1;
+                }
+                Outcome::Continue
+            }
+            Key::Char(c) => {
+                self.filter.push(c);
+                self.selected = 0;
+                Outcome::Continue
+            }
+            Key::Backspace => {
+                self.filter.pop();
+                self.selected = 0;
+                Outcome::Continue
+            }
+            Key::Esc => {
+                if self.filter.is_empty() {
+                    Outcome::Cancel
+                } else {
+                    self.filter.clear();
+                    self.selected = 0;
+                    Outcome::Continue
+                }
+            }
+            Key::DeleteEntry => {
+                let ts = self.visible().get(self.selected).map(|e| e.ts);
+                let Some(ts) = ts else { return Outcome::Continue };
+                self.entries.retain(|e| e.ts != ts);
+                let len = self.visible().len();
+                if len > 0 && self.selected >= len {
+                    self.selected = len - 1;
+                }
+                Outcome::Delete(ts)
+            }
+            Key::Enter => {
+                let Some(entry) = self.selected_entry() else { return Outcome::Continue };
+                let text = paste_text(&entry.text);
+                if text.contains('\n') && !self.pending_confirm {
+                    self.pending_confirm = true;
+                    self.status = Some(format!(
+                        "{}-line entry — press Enter again to paste",
+                        text.lines().count()
+                    ));
+                    return Outcome::Continue;
+                }
+                self.pending_confirm = false;
+                Outcome::Paste(text)
+            }
+        }
+    }
+}
+
+/// Strip at most one trailing newline (LF or CRLF) so pasting a
+/// shell-copied command doesn't immediately execute it.
+pub fn paste_text(text: &str) -> String {
+    let t = text.strip_suffix('\n').unwrap_or(text);
+    let t = t.strip_suffix('\r').unwrap_or(t);
+    t.to_string()
+}
+
+/// One-line list preview: whitespace runs flattened, char-boundary-safe
+/// truncation, `[NL]` badge for multiline entries.
+pub fn format_preview(text: &str, width: usize) -> String {
+    let lines = text.trim_end_matches('\n').lines().count();
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out = if lines > 1 { format!("[{lines}L] {flat}") } else { flat };
+    if out.chars().count() > width {
+        out = out.chars().take(width.saturating_sub(1)).collect::<String>() + "…";
+    }
+    if out.is_empty() {
+        out = "(whitespace)".into();
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::history::Entry;
+
+    fn entries() -> Vec<Entry> {
+        vec![
+            Entry { ts: 3, text: "newest cargo build".into() },
+            Entry { ts: 2, text: "middle".into() },
+            Entry { ts: 1, text: "oldest line".into() },
+        ]
+    }
+
+    #[test]
+    fn typing_filters_and_resets_selection() {
+        let mut s = PickerState::new(entries());
+        s.on_key(Key::Down);
+        for c in "cargo".chars() {
+            assert_eq!(s.on_key(Key::Char(c)), Outcome::Continue);
+        }
+        let vis: Vec<_> = s.visible().iter().map(|e| e.ts).collect();
+        assert_eq!(vis, vec![3]);
+        assert_eq!(s.selected, 0);
+    }
+
+    #[test]
+    fn navigation_clamps_to_visible_range() {
+        let mut s = PickerState::new(entries());
+        s.on_key(Key::Up);
+        assert_eq!(s.selected, 0);
+        for _ in 0..10 {
+            s.on_key(Key::Down);
+        }
+        assert_eq!(s.selected, 2);
+    }
+
+    #[test]
+    fn enter_pastes_single_line_entry() {
+        let mut s = PickerState::new(entries());
+        s.on_key(Key::Down);
+        assert_eq!(s.on_key(Key::Enter), Outcome::Paste("middle".into()));
+    }
+
+    #[test]
+    fn enter_on_multiline_requires_confirmation() {
+        let mut s = PickerState::new(vec![Entry { ts: 1, text: "a\nb\n".into() }]);
+        assert_eq!(s.on_key(Key::Enter), Outcome::Continue);
+        assert!(s.pending_confirm);
+        assert!(s.status.as_deref().unwrap_or("").contains("2-line"));
+        assert_eq!(s.on_key(Key::Enter), Outcome::Paste("a\nb".into()));
+    }
+
+    #[test]
+    fn any_other_key_disarms_multiline_confirmation() {
+        let mut s = PickerState::new(vec![Entry { ts: 1, text: "a\nb".into() }]);
+        s.on_key(Key::Enter);
+        s.on_key(Key::Down);
+        assert!(!s.pending_confirm);
+        assert_eq!(s.on_key(Key::Enter), Outcome::Continue); // re-arms, doesn't paste
+    }
+
+    #[test]
+    fn delete_removes_selected_and_reports_ts() {
+        let mut s = PickerState::new(entries());
+        s.on_key(Key::Down);
+        assert_eq!(s.on_key(Key::DeleteEntry), Outcome::Delete(2));
+        let vis: Vec<_> = s.visible().iter().map(|e| e.ts).collect();
+        assert_eq!(vis, vec![3, 1]);
+        // deleting the last entry pulls the selection back in range
+        s.on_key(Key::Down);
+        assert_eq!(s.on_key(Key::DeleteEntry), Outcome::Delete(1));
+        assert_eq!(s.selected, 0);
+    }
+
+    #[test]
+    fn esc_clears_filter_then_cancels() {
+        let mut s = PickerState::new(entries());
+        s.on_key(Key::Char('m'));
+        assert_eq!(s.on_key(Key::Esc), Outcome::Continue);
+        assert!(s.filter.is_empty());
+        assert_eq!(s.on_key(Key::Esc), Outcome::Cancel);
+    }
+
+    #[test]
+    fn enter_and_delete_on_empty_history_are_noops() {
+        let mut s = PickerState::new(Vec::new());
+        assert_eq!(s.on_key(Key::Enter), Outcome::Continue);
+        assert_eq!(s.on_key(Key::DeleteEntry), Outcome::Continue);
+    }
+
+    #[test]
+    fn paste_text_strips_at_most_one_trailing_newline() {
+        assert_eq!(paste_text("cmd\n"), "cmd");
+        assert_eq!(paste_text("cmd\r\n"), "cmd");
+        assert_eq!(paste_text("cmd\n\n"), "cmd\n");
+        assert_eq!(paste_text("cmd"), "cmd");
+    }
+
+    #[test]
+    fn format_preview_flattens_truncates_and_badges() {
+        assert_eq!(format_preview("plain text", 80), "plain text");
+        assert_eq!(format_preview("a\n  b\tc\n", 80), "[2L] a b c");
+        assert_eq!(format_preview("abcdef", 5), "abcd…");
+        assert_eq!(format_preview("   \n", 80), "(whitespace)");
+    }
+}

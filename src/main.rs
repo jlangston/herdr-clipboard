@@ -3,6 +3,7 @@ mod filter;
 mod herdr;
 mod history;
 mod paths;
+mod picker;
 mod watcher;
 
 fn main() {
