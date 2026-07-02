@@ -1,5 +1,6 @@
 mod config;
 mod filter;
+mod herdr;
 mod history;
 mod paths;
 
