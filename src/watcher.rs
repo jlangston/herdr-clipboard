@@ -25,18 +25,25 @@ pub fn ensure() {
         Ok(Some(_probe)) => {} // free (probe lock drops here) — spawn the daemon
         _ => return,           // held (daemon already running) or io error
     }
-    spawn_detached(&["watch-foreground"]);
+    spawn_detached(&["watch-foreground"], None);
 }
 
 /// Spawn the current executable with `args`, fully detached (own process
-/// group, null stdio). Best-effort: failures are ignored.
-pub fn spawn_detached(args: &[&str]) {
+/// group, null stdio). Best-effort: failures are ignored. When `stderr_log`
+/// is given, the child's stderr goes to that file (truncated each spawn so
+/// it only ever describes the latest run); if the file can't be created the
+/// spawn still proceeds with stderr nulled.
+pub fn spawn_detached(args: &[&str], stderr_log: Option<&Path>) {
     let Ok(exe) = std::env::current_exe() else { return };
+    let stderr = stderr_log
+        .and_then(|p| File::create(p).ok())
+        .map(Stdio::from)
+        .unwrap_or_else(Stdio::null);
     let mut cmd = Command::new(exe);
     cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(stderr);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;

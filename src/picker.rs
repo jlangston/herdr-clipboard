@@ -214,6 +214,13 @@ pub fn serve_clipboard(id: i64) -> io::Result<()> {
     Ok(())
 }
 
+/// True when the entry still exists and its PNG decodes — checked before
+/// spawning the detached serve-clipboard process, whose own failures the
+/// picker can no longer see or report.
+fn restorable_image(store: &HistoryStore, id: i64) -> bool {
+    matches!(store.get_image(id), Ok(Some(png)) if crate::img::decode_png(&png).is_ok())
+}
+
 /// `herdr-clip pick`: overlay picker entrypoint.
 pub fn run() -> io::Result<()> {
     watcher::ensure(); // covers restored sessions where no create events fired
@@ -265,8 +272,15 @@ fn event_loop(
             Outcome::Cancel => return Ok(()),
             Outcome::Delete(id) => store.delete(id)?,
             Outcome::RestoreImage(id) => {
-                watcher::spawn_detached(&["serve-clipboard", &id.to_string()]);
-                return Ok(());
+                if restorable_image(store, id) {
+                    watcher::spawn_detached(
+                        &["serve-clipboard", &id.to_string()],
+                        Some(&paths::state_dir().join("serve-clipboard.log")),
+                    );
+                    return Ok(());
+                }
+                // Keep the picker open so the user can choose another entry.
+                state.status = Some("restore failed: image missing or corrupt".into());
             }
             Outcome::Paste(text) => match paste(&text, target, self_pane) {
                 Ok(()) => return Ok(()),
@@ -480,6 +494,21 @@ mod tests {
     #[test]
     fn preview_badge_matches_confirm_line_count() {
         assert_eq!(format_preview("a\nb\n\n\n", 80), "[3L] a b");
+    }
+
+    #[test]
+    fn restore_validation_rejects_missing_and_corrupt_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = HistoryStore::new(dir.path(), 50, 1024, 5 * 1024 * 1024).unwrap();
+        s.append_image(&[1, 2, 3], 1, 1, 1, 1).unwrap(); // blob is not a decodable PNG
+        let corrupt_id = s.load()[0].id;
+        let rgba = [7u8; 4];
+        let png = crate::img::encode_rgba_png(1, 1, &rgba).unwrap();
+        s.append_image(&png, 1, 1, crate::img::rgba_hash(&rgba), 2).unwrap();
+        let good_id = s.load()[0].id;
+        assert!(restorable_image(&s, good_id));
+        assert!(!restorable_image(&s, corrupt_id), "undecodable blob must not spawn a server");
+        assert!(!restorable_image(&s, 9999), "missing id must not spawn a server");
     }
 
     #[test]
