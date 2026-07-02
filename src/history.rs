@@ -35,9 +35,13 @@ impl HistoryStore {
     /// Entries newest-first. Missing file or unparseable lines are not errors.
     pub fn load(&self) -> Vec<Entry> {
         let Ok(file) = File::open(&self.path) else { return Vec::new() };
+        // filter_map (not map_while): an invalid-UTF-8 line must not truncate
+        // every later entry. Safe here because read_line consumes the bad
+        // line's bytes before erroring, so iteration always advances.
+        #[allow(clippy::lines_filter_map_ok)]
         let mut entries: Vec<Entry> = BufReader::new(file)
             .lines()
-            .map_while(Result::ok)
+            .filter_map(Result::ok)
             .filter_map(|line| serde_json::from_str(&line).ok())
             .collect();
         entries.reverse();
@@ -72,8 +76,9 @@ impl HistoryStore {
         fs::rename(&tmp, &self.path)
     }
 
-    /// Remove the entry with this timestamp. Texts are unique after dedup,
-    /// so ts is a sufficient identifier.
+    /// Remove entries with this timestamp. In practice a single locked
+    /// watcher assigns timestamps, so collisions are not expected; if one
+    /// occurred, both entries would be removed.
     pub fn delete(&self, ts: u64) -> std::io::Result<()> {
         let _lock = self.lock()?;
         let mut entries = self.load();
@@ -83,7 +88,7 @@ impl HistoryStore {
 
     /// Exclusive advisory lock; released when the returned File drops.
     fn lock(&self) -> std::io::Result<File> {
-        let f = OpenOptions::new().create(true).write(true).open(&self.lock_path)?;
+        let f = OpenOptions::new().create(true).write(true).truncate(false).open(&self.lock_path)?;
         f.try_lock_exclusive().or_else(|_| f.lock_exclusive())?;
         Ok(f)
     }
@@ -191,5 +196,20 @@ mod tests {
         std::fs::write(&path, raw).unwrap();
         let texts: Vec<_> = s.load().iter().map(|e| e.text.clone()).collect();
         assert_eq!(texts, vec!["also good", "good"]);
+    }
+
+    #[test]
+    fn invalid_utf8_line_does_not_truncate_later_entries() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.append("older", 1).unwrap();
+        let path = dir.path().join("history.jsonl");
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(&[0xff, 0xfe, b'\n']).unwrap();
+        f.write_all(b"{\"ts\":2,\"text\":\"newer\"}\n").unwrap();
+        drop(f);
+        let texts: Vec<_> = s.load().iter().map(|e| e.text.clone()).collect();
+        assert_eq!(texts, vec!["newer", "older"]);
     }
 }
