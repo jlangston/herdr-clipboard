@@ -112,4 +112,28 @@ mod tests {
         store(dir.path()).append("kept", 1).unwrap();
         assert_eq!(store(dir.path()).load()[0].text, "kept");
     }
+
+    #[test]
+    fn append_identical_to_newest_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        assert!(s.append("same", 1).unwrap());
+        assert!(!s.append("same", 2).unwrap());
+        let entries = s.load();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].ts, 1, "skipped re-copy must not touch the timestamp");
+    }
+
+    #[test]
+    fn append_existing_older_text_moves_it_to_front() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.append("a", 1).unwrap();
+        s.append("b", 2).unwrap();
+        assert!(s.append("a", 3).unwrap());
+        let texts: Vec<_> = s.load().iter().map(|e| e.text.clone()).collect();
+        assert_eq!(texts, vec!["a", "b"]);
+        assert_eq!(s.load().len(), 2, "no duplicate row for re-copied text");
+        assert_eq!(s.load()[0].ts, 3, "moved entry gets the new timestamp");
+    }
 }
