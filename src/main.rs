@@ -28,7 +28,12 @@ fn main() {
 
 fn cmd_list() {
     let cfg = config::Config::load(paths::config_dir().as_deref());
-    let store = match history::HistoryStore::new(&paths::state_dir(), cfg.max_entries, cfg.max_entry_bytes) {
+    let store = match history::HistoryStore::new(
+        &paths::state_dir(),
+        cfg.max_entries,
+        cfg.max_entry_bytes,
+        cfg.max_image_bytes,
+    ) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("herdr-clip list: {e}");
@@ -36,6 +41,9 @@ fn cmd_list() {
         }
     };
     for (i, e) in store.load().iter().enumerate() {
-        println!("{i}\t{}\t{}", e.ts, picker::format_preview(&e.text, 100));
+        match &e.content {
+            history::Content::Text(t) => println!("{i}\t{}\t{}", e.ts, picker::format_preview(t, 100)),
+            history::Content::Image { .. } => println!("{i}\t{}\t<image>", e.ts),
+        }
     }
 }

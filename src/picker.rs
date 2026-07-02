@@ -1,5 +1,5 @@
 use crate::filter::fuzzy_match;
-use crate::history::Entry;
+use crate::history::{Content, Entry};
 
 use crate::config::Config;
 use crate::herdr::HerdrClient;
@@ -30,8 +30,10 @@ pub enum Outcome {
     Cancel,
     /// Final text to send (trailing newline already stripped).
     Paste(String),
-    /// Entry with this ts was removed from the state; persist the delete.
-    Delete(u64),
+    /// Image entry to restore to the system clipboard (by store id).
+    RestoreImage(i64),
+    /// Entry with this id was removed from the state; persist the delete.
+    Delete(i64),
 }
 
 pub struct PickerState {
@@ -49,7 +51,7 @@ impl PickerState {
 
     /// Filtered view, history order preserved (newest first).
     pub fn visible(&self) -> Vec<&Entry> {
-        self.entries.iter().filter(|e| fuzzy_match(&self.filter, &e.text)).collect()
+        self.entries.iter().filter(|e| fuzzy_match(&self.filter, &searchable(e))).collect()
     }
 
     pub fn selected_entry(&self) -> Option<&Entry> {
@@ -93,30 +95,48 @@ impl PickerState {
                 }
             }
             Key::DeleteEntry => {
-                let ts = self.visible().get(self.selected).map(|e| e.ts);
-                let Some(ts) = ts else { return Outcome::Continue };
-                self.entries.retain(|e| e.ts != ts);
+                let id = self.visible().get(self.selected).map(|e| e.id);
+                let Some(id) = id else { return Outcome::Continue };
+                self.entries.retain(|e| e.id != id);
                 let len = self.visible().len();
                 if len > 0 && self.selected >= len {
                     self.selected = len - 1;
                 }
-                Outcome::Delete(ts)
+                Outcome::Delete(id)
             }
             Key::Enter => {
                 let Some(entry) = self.selected_entry() else { return Outcome::Continue };
-                let text = paste_text(&entry.text);
-                if text.contains('\n') && !self.pending_confirm {
-                    self.pending_confirm = true;
-                    self.status = Some(format!(
-                        "{}-line entry — press Enter again to paste",
-                        text.lines().count()
-                    ));
-                    return Outcome::Continue;
+                let id = entry.id;
+                match &entry.content {
+                    Content::Image { .. } => {
+                        self.pending_confirm = false;
+                        Outcome::RestoreImage(id)
+                    }
+                    Content::Text(t) => {
+                        let text = paste_text(t);
+                        if text.contains('\n') && !self.pending_confirm {
+                            self.pending_confirm = true;
+                            self.status = Some(format!(
+                                "{}-line entry — press Enter again to paste",
+                                text.lines().count()
+                            ));
+                            return Outcome::Continue;
+                        }
+                        self.pending_confirm = false;
+                        Outcome::Paste(text)
+                    }
                 }
-                self.pending_confirm = false;
-                Outcome::Paste(text)
             }
         }
+    }
+}
+
+/// What the fuzzy filter runs against: the text itself, or a stable
+/// searchable label for images ("img"/"image" and the dimensions match).
+fn searchable(e: &Entry) -> String {
+    match &e.content {
+        Content::Text(t) => t.clone(),
+        Content::Image { w, h, .. } => format!("image img {w}x{h}"),
     }
 }
 
@@ -143,12 +163,30 @@ pub fn format_preview(text: &str, width: usize) -> String {
     out
 }
 
+/// One-line list label for any entry kind.
+pub fn entry_label(e: &Entry, width: usize) -> String {
+    match &e.content {
+        Content::Text(t) => format_preview(t, width),
+        Content::Image { w, h, bytes } => format!("[IMG {w}x{h} · {}]", human_size(*bytes)),
+    }
+}
+
+fn human_size(bytes: usize) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 /// `herdr-clip pick`: overlay picker entrypoint.
 pub fn run() -> io::Result<()> {
     watcher::ensure(); // covers restored sessions where no create events fired
     let cfg = Config::load(paths::config_dir().as_deref());
     let state_dir = paths::state_dir();
-    let store = HistoryStore::new(&state_dir, cfg.max_entries, cfg.max_entry_bytes)?;
+    let store = HistoryStore::new(&state_dir, cfg.max_entries, cfg.max_entry_bytes, cfg.max_image_bytes)?;
 
     // Paste target: the pane focused before this overlay took focus,
     // recorded by the watcher. Never target ourselves.
@@ -192,7 +230,8 @@ fn event_loop(
         match state.on_key(mapped) {
             Outcome::Continue => {}
             Outcome::Cancel => return Ok(()),
-            Outcome::Delete(ts) => store.delete(ts)?,
+            Outcome::Delete(id) => store.delete(id)?,
+            Outcome::RestoreImage(_) => return Ok(()), // TEMPORARY: Task 7 wires the real serve-clipboard flow
             Outcome::Paste(text) => match paste(&text, target, self_pane) {
                 Ok(()) => return Ok(()),
                 Err(e) => state.status = Some(format!("paste failed: {e}")),
@@ -228,7 +267,7 @@ fn draw(frame: &mut Frame, state: &PickerState) {
     let visible = state.visible();
     let items: Vec<ListItem> = visible
         .iter()
-        .map(|e| ListItem::new(format_preview(&e.text, list_area.width.saturating_sub(3) as usize)))
+        .map(|e| ListItem::new(entry_label(e, list_area.width.saturating_sub(3) as usize)))
         .collect();
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(" clipboard history "))
@@ -239,7 +278,13 @@ fn draw(frame: &mut Frame, state: &PickerState) {
 
     let preview = state
         .selected_entry()
-        .map(|e| e.text.clone())
+        .map(|e| match &e.content {
+            Content::Text(t) => t.clone(),
+            Content::Image { w, h, bytes } => format!(
+                "PNG image {w}×{h}, {}.\n\nEnter restores it to the system clipboard.",
+                human_size(*bytes)
+            ),
+        })
         .unwrap_or_else(|| "clipboard history is empty — copy something first".into());
     frame.render_widget(
         Paragraph::new(preview)
@@ -260,14 +305,18 @@ fn draw(frame: &mut Frame, state: &PickerState) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::Entry;
+    use crate::history::{Content, Entry};
+
+    fn t(id: i64, ts: u64, text: &str) -> Entry {
+        Entry { id, ts, content: Content::Text(text.into()) }
+    }
+
+    fn img(id: i64, ts: u64, w: u32, h: u32, bytes: usize) -> Entry {
+        Entry { id, ts, content: Content::Image { w, h, bytes } }
+    }
 
     fn entries() -> Vec<Entry> {
-        vec![
-            Entry { ts: 3, text: "newest cargo build".into() },
-            Entry { ts: 2, text: "middle".into() },
-            Entry { ts: 1, text: "oldest line".into() },
-        ]
+        vec![t(3, 3, "newest cargo build"), t(2, 2, "middle"), t(1, 1, "oldest line")]
     }
 
     #[test]
@@ -277,7 +326,7 @@ mod tests {
         for c in "cargo".chars() {
             assert_eq!(s.on_key(Key::Char(c)), Outcome::Continue);
         }
-        let vis: Vec<_> = s.visible().iter().map(|e| e.ts).collect();
+        let vis: Vec<_> = s.visible().iter().map(|e| e.id).collect();
         assert_eq!(vis, vec![3]);
         assert_eq!(s.selected, 0);
     }
@@ -302,7 +351,7 @@ mod tests {
 
     #[test]
     fn enter_on_multiline_requires_confirmation() {
-        let mut s = PickerState::new(vec![Entry { ts: 1, text: "a\nb\n".into() }]);
+        let mut s = PickerState::new(vec![t(1, 1, "a\nb\n")]);
         assert_eq!(s.on_key(Key::Enter), Outcome::Continue);
         assert!(s.pending_confirm);
         assert!(s.status.as_deref().unwrap_or("").contains("2-line"));
@@ -311,7 +360,7 @@ mod tests {
 
     #[test]
     fn any_other_key_disarms_multiline_confirmation() {
-        let mut s = PickerState::new(vec![Entry { ts: 1, text: "a\nb".into() }]);
+        let mut s = PickerState::new(vec![t(1, 1, "a\nb")]);
         s.on_key(Key::Enter);
         s.on_key(Key::Down);
         assert!(!s.pending_confirm);
@@ -319,13 +368,29 @@ mod tests {
     }
 
     #[test]
-    fn delete_removes_selected_and_reports_ts() {
+    fn enter_on_image_restores_without_confirmation() {
+        let mut s = PickerState::new(vec![img(7, 1, 640, 480, 1000)]);
+        assert_eq!(s.on_key(Key::Enter), Outcome::RestoreImage(7));
+        assert!(!s.pending_confirm);
+    }
+
+    #[test]
+    fn images_match_filter_by_badge_text() {
+        let mut s = PickerState::new(vec![t(2, 2, "hello"), img(1, 1, 640, 480, 1000)]);
+        for c in "img".chars() {
+            s.on_key(Key::Char(c));
+        }
+        let vis: Vec<_> = s.visible().iter().map(|e| e.id).collect();
+        assert_eq!(vis, vec![1]);
+    }
+
+    #[test]
+    fn delete_removes_selected_and_reports_id() {
         let mut s = PickerState::new(entries());
         s.on_key(Key::Down);
         assert_eq!(s.on_key(Key::DeleteEntry), Outcome::Delete(2));
-        let vis: Vec<_> = s.visible().iter().map(|e| e.ts).collect();
+        let vis: Vec<_> = s.visible().iter().map(|e| e.id).collect();
         assert_eq!(vis, vec![3, 1]);
-        // deleting the last entry pulls the selection back in range
         s.on_key(Key::Down);
         assert_eq!(s.on_key(Key::DeleteEntry), Outcome::Delete(1));
         assert_eq!(s.selected, 0);
@@ -348,6 +413,19 @@ mod tests {
     }
 
     #[test]
+    fn keys_are_noops_when_filter_matches_nothing() {
+        let mut s = PickerState::new(vec![t(1, 1, "hello")]);
+        for c in "zzz".chars() {
+            s.on_key(Key::Char(c));
+        }
+        assert!(s.visible().is_empty());
+        s.on_key(Key::Up);
+        s.on_key(Key::Down);
+        assert_eq!(s.on_key(Key::Enter), Outcome::Continue);
+        assert_eq!(s.on_key(Key::DeleteEntry), Outcome::Continue);
+    }
+
+    #[test]
     fn paste_text_strips_at_most_one_trailing_newline() {
         assert_eq!(paste_text("cmd\n"), "cmd");
         assert_eq!(paste_text("cmd\r\n"), "cmd");
@@ -365,20 +443,13 @@ mod tests {
 
     #[test]
     fn preview_badge_matches_confirm_line_count() {
-        // paste_text("a\nb\n\n\n") == "a\nb\n\n" == 3 lines; badge must agree
         assert_eq!(format_preview("a\nb\n\n\n", 80), "[3L] a b");
     }
 
     #[test]
-    fn keys_are_noops_when_filter_matches_nothing() {
-        let mut s = PickerState::new(vec![Entry { ts: 1, text: "hello".into() }]);
-        for c in "zzz".chars() {
-            s.on_key(Key::Char(c));
-        }
-        assert!(s.visible().is_empty());
-        s.on_key(Key::Up);
-        s.on_key(Key::Down);
-        assert_eq!(s.on_key(Key::Enter), Outcome::Continue);
-        assert_eq!(s.on_key(Key::DeleteEntry), Outcome::Continue);
+    fn entry_labels_cover_both_kinds() {
+        assert_eq!(entry_label(&t(1, 1, "some text"), 80), "some text");
+        assert_eq!(entry_label(&img(1, 1, 1920, 1080, 2 * 1024 * 1024), 80), "[IMG 1920x1080 · 2.0 MB]");
+        assert_eq!(entry_label(&img(1, 1, 8, 8, 300), 80), "[IMG 8x8 · 300 B]");
     }
 }

@@ -53,7 +53,7 @@ pub fn run() -> ! {
     };
 
     let cfg = Config::load(paths::config_dir().as_deref());
-    let store = HistoryStore::new(&state_dir, cfg.max_entries, cfg.max_entry_bytes)
+    let store = HistoryStore::new(&state_dir, cfg.max_entries, cfg.max_entry_bytes, cfg.max_image_bytes)
         .expect("open history store");
     let poll = Duration::from_millis(cfg.poll_ms.max(50));
     std::thread::spawn(move || poll_clipboard(store, poll));
@@ -106,7 +106,7 @@ fn poll_clipboard(store: HistoryStore, poll: Duration) {
         // Wayland quirks) just mean "nothing to record this tick".
         if let Ok(text) = clipboard.get_text() {
             if last.as_deref() != Some(text.as_str()) {
-                let _ = store.append(&text, now_ms());
+                let _ = store.append_text(&text, now_ms());
                 last = Some(text);
             }
         }
