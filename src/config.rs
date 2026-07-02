@@ -19,12 +19,18 @@ impl Config {
     /// Read `<config_dir>/config.toml`; any problem (no dir, no file,
     /// parse error) silently yields defaults — a broken config must not
     /// take the clipboard down.
+    /// Zero values are treated as broken and fall back per-field.
     pub fn load(config_dir: Option<&Path>) -> Self {
-        config_dir
+        let mut c: Config = config_dir
             .map(|d| d.join("config.toml"))
             .and_then(|p| std::fs::read_to_string(p).ok())
             .and_then(|s| toml::from_str(&s).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        let d = Config::default();
+        if c.max_entries == 0 { c.max_entries = d.max_entries; }
+        if c.max_entry_bytes == 0 { c.max_entry_bytes = d.max_entry_bytes; }
+        if c.poll_ms == 0 { c.poll_ms = d.poll_ms; }
+        c
     }
 }
 
@@ -56,5 +62,16 @@ mod tests {
         assert_eq!(Config::load(Some(dir.path())), Config::default()); // no file
         std::fs::write(dir.path().join("config.toml"), "max_entries = \"lots\"").unwrap();
         assert_eq!(Config::load(Some(dir.path())), Config::default()); // bad type
+    }
+
+    #[test]
+    fn zero_values_fall_back_to_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "max_entries = 0\nmax_entry_bytes = 0\npoll_ms = 0\n",
+        )
+        .unwrap();
+        assert_eq!(Config::load(Some(dir.path())), Config::default());
     }
 }
