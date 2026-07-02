@@ -1,0 +1,55 @@
+id = "jlangston.multi-clipboard"
+name = "Multi Clipboard"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "tmux-style clipboard history picker (prefix+plus)"
+platforms = ["linux", "macos"]
+
+[[build]]
+command = ["cargo", "build", "--release"]
+
+# The `./` prefix is required: herdr resolves plugin-pane commands via a PATH
+# lookup and rejects a bare relative path ("No viable candidates found in
+# PATH"). `./target/...` is taken as relative to the plugin root (the process
+# cwd), which is where the release binary lands.
+[[panes]]
+id = "picker"
+title = "Clipboard history"
+placement = "overlay"
+command = ["./target/release/herdr-clip", "pick"]
+
+# Watcher autostart. Idempotent: `watch` exits immediately when a daemon
+# already holds the lock, so firing on every workspace/pane create is cheap.
+# Verified on herdr 0.7.1: these hooks run with HERDR_PLUGIN_STATE_DIR set and
+# cwd = plugin root, and the pane.focused subscription the daemon then opens
+# delivers the events that populate last_focused_pane.
+[[events]]
+on = "workspace.created"
+command = ["./target/release/herdr-clip", "watch"]
+
+[[events]]
+on = "pane.created"
+command = ["./target/release/herdr-clip", "watch"]
+
+# Spec open question 1 — RESOLVED against herdr 0.7.1: the plugin manifest has
+# no keybinding section. herdr silently drops any `[[keys.command]]` here (it
+# is a herdr *config.toml* construct, not a manifest one), so plans A/B do not
+# apply. Keybindings live in the user's ~/.config/herdr/config.toml. Because
+# the picker is a TUI that must run in a pane AND read this plugin's state dir
+# (where the watcher records history), the binding should open THIS declared
+# pane so herdr injects HERDR_PLUGIN_STATE_DIR. A raw `type = "pane"` command
+# running the binary directly would not get that env and would read an empty
+# fallback store. Recommended user binding (the user must add this themselves):
+#
+#   [[keys.command]]
+#   key = "prefix+plus"
+#   type = "shell"
+#   command = "herdr plugin pane open --plugin jlangston.multi-clipboard --entrypoint picker"
+#   description = "Clipboard history"
+#
+# Spec open question 2 — RESOLVED against herdr 0.7.1: pane.send_text does NOT
+# bracketed-paste. A single-line entry (trailing newline stripped by the
+# picker) lands on the target pane's prompt UNEXECUTED. A multiline entry's
+# interior newlines are interpreted as Enter, so every line but the last is
+# executed on arrival — which is exactly why the picker requires a second Enter
+# to confirm a multiline paste.
