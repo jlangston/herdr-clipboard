@@ -60,7 +60,9 @@ impl HistoryStore {
             );",
         )
         .map_err(io::Error::other)?;
-        Ok(Self { conn, max_entries, max_entry_bytes, max_image_bytes })
+        let store = Self { conn, max_entries, max_entry_bytes, max_image_bytes };
+        store.migrate_v1_jsonl(state_dir)?;
+        Ok(store)
     }
 
     /// Entries newest-first (by insertion order — `id` is the monotonic
@@ -184,6 +186,32 @@ impl HistoryStore {
         )
         .map_err(io::Error::other)?;
         Ok(())
+    }
+
+    /// One-shot import of v1's history.jsonl: only when the DB is empty and
+    /// the file exists; the file is renamed to .bak afterwards so it never
+    /// re-imports. Corrupt lines are skipped, matching v1's load behavior.
+    fn migrate_v1_jsonl(&self, state_dir: &Path) -> io::Result<()> {
+        let jsonl = state_dir.join("history.jsonl");
+        if !jsonl.exists() {
+            return Ok(());
+        }
+        let count: i64 = self
+            .conn
+            .query_row("SELECT count(*) FROM entries", [], |r| r.get(0))
+            .map_err(io::Error::other)?;
+        if count == 0 {
+            #[derive(serde::Deserialize)]
+            struct LegacyEntry {
+                ts: u64,
+                text: String,
+            }
+            for line in fs::read_to_string(&jsonl)?.lines() {
+                let Ok(e) = serde_json::from_str::<LegacyEntry>(line) else { continue };
+                self.append_text(&e.text, e.ts)?;
+            }
+        }
+        fs::rename(&jsonl, state_dir.join("history.jsonl.bak"))
     }
 }
 
@@ -332,5 +360,30 @@ mod tests {
         s.append_text("new", 3).unwrap();
         assert_eq!(s.load().len(), 2);
         assert_eq!(texts(&s), vec!["new", "<image>"]);
+    }
+
+    #[test]
+    fn migrates_v1_jsonl_once_and_renames_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("history.jsonl"),
+            "{\"ts\":1,\"text\":\"old a\"}\n{not json\n{\"ts\":2,\"text\":\"old b\"}\n",
+        )
+        .unwrap();
+        let s = store(dir.path());
+        assert_eq!(texts(&s), vec!["old b", "old a"], "corrupt line skipped, order kept");
+        assert!(!dir.path().join("history.jsonl").exists());
+        assert!(dir.path().join("history.jsonl.bak").exists());
+        // Reopening must not re-import from the .bak
+        s.append_text("new", 3).unwrap();
+        assert_eq!(texts(&store(dir.path())), vec!["new", "old b", "old a"]);
+    }
+
+    #[test]
+    fn no_migration_when_db_already_has_data() {
+        let dir = tempfile::tempdir().unwrap();
+        store(dir.path()).append_text("existing", 1).unwrap();
+        std::fs::write(dir.path().join("history.jsonl"), "{\"ts\":9,\"text\":\"stale\"}\n").unwrap();
+        assert_eq!(texts(&store(dir.path())), vec!["existing"]);
     }
 }
