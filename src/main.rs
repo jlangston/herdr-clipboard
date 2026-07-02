@@ -2,6 +2,7 @@ mod config;
 mod filter;
 mod herdr;
 mod history;
+mod img;
 mod paths;
 mod picker;
 mod watcher;
