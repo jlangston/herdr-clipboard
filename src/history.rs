@@ -36,31 +36,46 @@ impl HistoryStore {
         max_image_bytes: usize,
     ) -> io::Result<Self> {
         fs::create_dir_all(state_dir)?;
-        let conn = Connection::open(state_dir.join("history.db")).map_err(io::Error::other)?;
+        let mut conn = Connection::open(state_dir.join("history.db")).map_err(io::Error::other)?;
+        // BEGIN IMMEDIATE up front so a writer racing another process's
+        // writer fails fast into busy_timeout's retry loop instead of
+        // surfacing SQLITE_BUSY_SNAPSHOT from a deferred transaction that
+        // upgraded mid-flight (which busy_timeout does not retry).
+        conn.set_transaction_behavior(rusqlite::TransactionBehavior::Immediate);
         conn.busy_timeout(Duration::from_secs(5)).map_err(io::Error::other)?;
         conn.pragma_update(None, "journal_mode", "WAL").map_err(io::Error::other)?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS entries (
                 id    INTEGER PRIMARY KEY,
                 ts    INTEGER NOT NULL,
-                kind  TEXT NOT NULL CHECK (kind IN ('text','image')),
+                kind  TEXT NOT NULL,
                 text  TEXT,
                 img   BLOB,
                 img_w INTEGER,
-                img_h INTEGER
+                img_h INTEGER,
+                CHECK (
+                    (kind = 'text' AND text IS NOT NULL AND img IS NULL)
+                    OR (kind = 'image' AND img IS NOT NULL AND text IS NULL)
+                )
             );",
         )
         .map_err(io::Error::other)?;
         Ok(Self { conn, max_entries, max_entry_bytes, max_image_bytes })
     }
 
-    /// Entries newest-first; image entries carry metadata only.
+    /// Entries newest-first (by insertion order — `id` is the monotonic
+    /// SQLite rowid, immune to wall-clock skew; `ts` is display-only).
+    /// Image entries carry metadata only.
     pub fn load(&self) -> Vec<Entry> {
-        let Ok(mut stmt) = self.conn.prepare(
-            "SELECT id, ts, kind, text, img_w, img_h, length(img)
-             FROM entries ORDER BY ts DESC, id DESC",
-        ) else {
-            return Vec::new();
+        let mut stmt = match self
+            .conn
+            .prepare("SELECT id, ts, kind, text, img_w, img_h, length(img) FROM entries ORDER BY id DESC")
+        {
+            Ok(stmt) => stmt,
+            Err(e) => {
+                eprintln!("herdr-clip: history query failed: {e}");
+                return Vec::new();
+            }
         };
         let rows = stmt.query_map([], |row| {
             let kind: String = row.get(2)?;
@@ -77,7 +92,10 @@ impl HistoryStore {
         });
         match rows {
             Ok(iter) => iter.filter_map(Result::ok).collect(),
-            Err(_) => Vec::new(),
+            Err(e) => {
+                eprintln!("herdr-clip: history query failed: {e}");
+                Vec::new()
+            }
         }
     }
 
@@ -121,7 +139,7 @@ impl HistoryStore {
     fn enforce_cap(tx: &rusqlite::Transaction, max_entries: usize) -> io::Result<()> {
         tx.execute(
             "DELETE FROM entries WHERE id IN (
-                SELECT id FROM entries ORDER BY ts DESC, id DESC LIMIT -1 OFFSET ?1
+                SELECT id FROM entries ORDER BY id DESC LIMIT -1 OFFSET ?1
             )",
             params![max_entries as i64],
         )
@@ -225,5 +243,14 @@ mod tests {
         let drop_id = s.load()[0].id;
         s.delete(drop_id).unwrap();
         assert_eq!(texts(&s), vec!["keep"]);
+    }
+
+    #[test]
+    fn insertion_order_wins_over_wall_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.append_text("first", 100).unwrap();
+        s.append_text("second", 50).unwrap(); // clock went backwards
+        assert_eq!(texts(&s), vec!["second", "first"]);
     }
 }
