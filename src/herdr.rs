@@ -22,6 +22,9 @@ impl HerdrClient {
         Self { writer: stream, reader, next_id: 0 }
     }
 
+    /// NOTE: do not call this on a connection that is also being drained via
+    /// `read_line` for subscribed events — pushed events that arrive during
+    /// the request's round-trip are skipped and lost.
     pub fn request(&mut self, method: &str, params: Value) -> io::Result<Value> {
         self.next_id += 1;
         let id = format!("req_{}", self.next_id);
