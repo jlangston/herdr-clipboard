@@ -136,4 +136,25 @@ mod tests {
         assert_eq!(s.load().len(), 2, "no duplicate row for re-copied text");
         assert_eq!(s.load()[0].ts, 3, "moved entry gets the new timestamp");
     }
+
+    #[test]
+    fn history_is_capped_dropping_oldest() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = HistoryStore::new(dir.path(), 3, 256 * 1024).unwrap();
+        for (i, t) in ["a", "b", "c", "d"].iter().enumerate() {
+            s.append(t, i as u64).unwrap();
+        }
+        let texts: Vec<_> = s.load().iter().map(|e| e.text.clone()).collect();
+        assert_eq!(texts, vec!["d", "c", "b"]);
+    }
+
+    #[test]
+    fn oversized_and_empty_text_are_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = HistoryStore::new(dir.path(), 50, 10).unwrap();
+        assert!(!s.append("", 1).unwrap());
+        assert!(!s.append("12345678901", 2).unwrap()); // 11 bytes > 10
+        assert!(s.append("1234567890", 3).unwrap()); // exactly 10 is fine
+        assert_eq!(s.load().len(), 1);
+    }
 }
