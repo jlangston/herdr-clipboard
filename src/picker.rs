@@ -1,6 +1,18 @@
 use crate::filter::fuzzy_match;
 use crate::history::Entry;
 
+use crate::config::Config;
+use crate::herdr::HerdrClient;
+use crate::history::HistoryStore;
+use crate::{paths, watcher};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::layout::{Constraint, Layout};
+use ratatui::style::{Modifier, Style};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::Frame;
+use std::fs;
+use std::io;
+
 /// Terminal-agnostic key model so state transitions test without a TTY.
 pub enum Key {
     Up,
@@ -129,6 +141,120 @@ pub fn format_preview(text: &str, width: usize) -> String {
         out = "(whitespace)".into();
     }
     out
+}
+
+/// `herdr-clip pick`: overlay picker entrypoint.
+pub fn run() -> io::Result<()> {
+    watcher::ensure(); // covers restored sessions where no create events fired
+    let cfg = Config::load(paths::config_dir().as_deref());
+    let state_dir = paths::state_dir();
+    let store = HistoryStore::new(&state_dir, cfg.max_entries, cfg.max_entry_bytes)?;
+
+    // Paste target: the pane focused before this overlay took focus,
+    // recorded by the watcher. Never target ourselves.
+    let self_pane = std::env::var("HERDR_PANE_ID").ok();
+    let target = fs::read_to_string(state_dir.join(watcher::FOCUS_FILE))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && Some(s) != self_pane.as_ref());
+
+    let mut state = PickerState::new(store.load());
+    let mut terminal = ratatui::init();
+    let result = event_loop(&mut terminal, &mut state, &store, target.as_deref(), self_pane.as_deref());
+    ratatui::restore();
+    result
+}
+
+fn event_loop(
+    terminal: &mut ratatui::DefaultTerminal,
+    state: &mut PickerState,
+    store: &HistoryStore,
+    target: Option<&str>,
+    self_pane: Option<&str>,
+) -> io::Result<()> {
+    loop {
+        terminal.draw(|frame| draw(frame, state))?;
+        let Event::Key(key) = event::read()? else { continue };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        let mapped = match (key.code, key.modifiers) {
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(()),
+            (KeyCode::Char('d'), KeyModifiers::CONTROL) | (KeyCode::Delete, _) => Key::DeleteEntry,
+            (KeyCode::Char('p'), KeyModifiers::CONTROL) | (KeyCode::Up, _) => Key::Up,
+            (KeyCode::Char('n'), KeyModifiers::CONTROL) | (KeyCode::Down, _) => Key::Down,
+            (KeyCode::Enter, _) => Key::Enter,
+            (KeyCode::Esc, _) => Key::Esc,
+            (KeyCode::Backspace, _) => Key::Backspace,
+            (KeyCode::Char(c), m) if m.is_empty() || m == KeyModifiers::SHIFT => Key::Char(c),
+            _ => continue,
+        };
+        match state.on_key(mapped) {
+            Outcome::Continue => {}
+            Outcome::Cancel => return Ok(()),
+            Outcome::Delete(ts) => store.delete(ts)?,
+            Outcome::Paste(text) => match paste(&text, target, self_pane) {
+                Ok(()) => return Ok(()),
+                Err(e) => state.status = Some(format!("paste failed: {e}")),
+            },
+        }
+    }
+}
+
+/// Send to the recorded target pane; if that fails (pane closed) fall back
+/// to whatever pane herdr says is focused, excluding the picker itself.
+fn paste(text: &str, target: Option<&str>, self_pane: Option<&str>) -> io::Result<()> {
+    let mut client = HerdrClient::connect()?;
+    if let Some(t) = target {
+        if client.send_text(t, text).is_ok() {
+            return Ok(());
+        }
+    }
+    let fallback = client
+        .focused_pane_id()?
+        .filter(|id| Some(id.as_str()) != self_pane)
+        .ok_or_else(|| io::Error::other("no target pane"))?;
+    client.send_text(&fallback, text)
+}
+
+fn draw(frame: &mut Frame, state: &PickerState) {
+    let [list_area, preview_area, footer_area] = Layout::vertical([
+        Constraint::Min(3),
+        Constraint::Percentage(40),
+        Constraint::Length(1),
+    ])
+    .areas(frame.area());
+
+    let visible = state.visible();
+    let items: Vec<ListItem> = visible
+        .iter()
+        .map(|e| ListItem::new(format_preview(&e.text, list_area.width.saturating_sub(3) as usize)))
+        .collect();
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(" clipboard history "))
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    let mut ls = ListState::default();
+    ls.select((!visible.is_empty()).then_some(state.selected));
+    frame.render_stateful_widget(list, list_area, &mut ls);
+
+    let preview = state
+        .selected_entry()
+        .map(|e| e.text.clone())
+        .unwrap_or_else(|| "clipboard history is empty — copy something first".into());
+    frame.render_widget(
+        Paragraph::new(preview)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL).title(" preview ")),
+        preview_area,
+    );
+
+    let footer = state.status.clone().unwrap_or_else(|| {
+        format!(
+            "filter: {}▏  ↑/↓ move · type to filter · Enter paste · Ctrl+D delete · Esc quit",
+            state.filter
+        )
+    });
+    frame.render_widget(Paragraph::new(footer), footer_area);
 }
 
 #[cfg(test)]

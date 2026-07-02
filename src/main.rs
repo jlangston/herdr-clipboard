@@ -11,11 +11,25 @@ fn main() {
     match args.first().map(String::as_str) {
         Some("watch") => watcher::ensure(),
         Some("watch-foreground") => watcher::run(),
-        Some("pick") => todo!("Task 12"),
-        Some("list") => todo!("Task 12"),
+        Some("pick") => {
+            if let Err(e) = picker::run() {
+                eprintln!("herdr-clip pick: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some("list") => cmd_list(),
         _ => {
             eprintln!("usage: herdr-clip <watch|pick|list>");
             std::process::exit(2);
         }
+    }
+}
+
+fn cmd_list() {
+    let cfg = config::Config::load(paths::config_dir().as_deref());
+    let store = history::HistoryStore::new(&paths::state_dir(), cfg.max_entries, cfg.max_entry_bytes)
+        .expect("open history store");
+    for (i, e) in store.load().iter().enumerate() {
+        println!("{i}\t{}\t{}", e.ts, picker::format_preview(&e.text, 100));
     }
 }
