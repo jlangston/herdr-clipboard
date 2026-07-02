@@ -27,8 +27,13 @@ fn main() {
 
 fn cmd_list() {
     let cfg = config::Config::load(paths::config_dir().as_deref());
-    let store = history::HistoryStore::new(&paths::state_dir(), cfg.max_entries, cfg.max_entry_bytes)
-        .expect("open history store");
+    let store = match history::HistoryStore::new(&paths::state_dir(), cfg.max_entries, cfg.max_entry_bytes) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("herdr-clip list: {e}");
+            std::process::exit(1);
+        }
+    };
     for (i, e) in store.load().iter().enumerate() {
         println!("{i}\t{}\t{}", e.ts, picker::format_preview(&e.text, 100));
     }
