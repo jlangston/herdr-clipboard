@@ -25,16 +25,22 @@ pub fn ensure() {
         Ok(Some(_probe)) => {} // free (probe lock drops here) — spawn the daemon
         _ => return,           // held (daemon already running) or io error
     }
+    spawn_detached(&["watch-foreground"]);
+}
+
+/// Spawn the current executable with `args`, fully detached (own process
+/// group, null stdio). Best-effort: failures are ignored.
+pub fn spawn_detached(args: &[&str]) {
     let Ok(exe) = std::env::current_exe() else { return };
     let mut cmd = Command::new(exe);
-    cmd.arg("watch-foreground")
+    cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        cmd.process_group(0); // detach from the hook's process group
+        cmd.process_group(0);
     }
     let _ = cmd.spawn();
 }
@@ -100,14 +106,26 @@ fn poll_clipboard(store: HistoryStore, poll: Duration) {
             Err(_) => std::thread::sleep(Duration::from_secs(2)), // display not ready yet
         }
     };
-    let mut last: Option<String> = None;
+    let mut last_text: Option<String> = None;
+    let mut last_img: Option<Vec<u8>> = None;
     loop {
         // get_text errors (empty clipboard, non-text content, transient
         // Wayland quirks) just mean "nothing to record this tick".
         if let Ok(text) = clipboard.get_text() {
-            if last.as_deref() != Some(text.as_str()) {
+            if last_text.as_deref() != Some(text.as_str()) {
                 let _ = store.append_text(&text, now_ms());
-                last = Some(text);
+                last_text = Some(text);
+            }
+        }
+        // get_image errors mean "clipboard isn't an image right now" — skip.
+        if let Ok(image) = clipboard.get_image() {
+            if last_img.as_deref() != Some(image.bytes.as_ref()) {
+                if let Ok(png) =
+                    crate::img::encode_rgba_png(image.width as u32, image.height as u32, &image.bytes)
+                {
+                    let _ = store.append_image(&png, image.width as u32, image.height as u32, now_ms());
+                }
+                last_img = Some(image.bytes.into_owned());
             }
         }
         std::thread::sleep(poll);

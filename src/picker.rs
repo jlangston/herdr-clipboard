@@ -181,6 +181,39 @@ fn human_size(bytes: usize) -> String {
     }
 }
 
+/// `herdr-clip serve-clipboard <id>`: put an image entry back on the system
+/// clipboard and keep serving it until another app takes ownership (on
+/// Linux clipboard contents die with the owning process, so the short-lived
+/// picker cannot do this itself). Starting a new server replaces — and so
+/// terminates — the previous one.
+pub fn serve_clipboard(id: i64) -> io::Result<()> {
+    let cfg = Config::load(paths::config_dir().as_deref());
+    let store = HistoryStore::new(
+        &paths::state_dir(),
+        cfg.max_entries,
+        cfg.max_entry_bytes,
+        cfg.max_image_bytes,
+    )?;
+    let png = store
+        .get_image(id)?
+        .ok_or_else(|| io::Error::other("image entry not found"))?;
+    let (w, h, rgba) = crate::img::decode_png(&png)?;
+    let image = arboard::ImageData {
+        width: w as usize,
+        height: h as usize,
+        bytes: rgba.into(),
+    };
+    let mut clipboard = arboard::Clipboard::new().map_err(io::Error::other)?;
+    #[cfg(target_os = "linux")]
+    {
+        use arboard::SetExtLinux;
+        clipboard.set().wait().image(image).map_err(io::Error::other)?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    clipboard.set_image(image).map_err(io::Error::other)?;
+    Ok(())
+}
+
 /// `herdr-clip pick`: overlay picker entrypoint.
 pub fn run() -> io::Result<()> {
     watcher::ensure(); // covers restored sessions where no create events fired
@@ -231,7 +264,10 @@ fn event_loop(
             Outcome::Continue => {}
             Outcome::Cancel => return Ok(()),
             Outcome::Delete(id) => store.delete(id)?,
-            Outcome::RestoreImage(_) => return Ok(()), // TEMPORARY: Task 7 wires the real serve-clipboard flow
+            Outcome::RestoreImage(id) => {
+                watcher::spawn_detached(&["serve-clipboard", &id.to_string()]);
+                return Ok(());
+            }
             Outcome::Paste(text) => match paste(&text, target, self_pane) {
                 Ok(()) => return Ok(()),
                 Err(e) => state.status = Some(format!("paste failed: {e}")),
