@@ -4,6 +4,17 @@ use std::io;
 /// screenshot, low enough that corrupt DB blobs can't force a huge allocation.
 const MAX_DECODED_BYTES: usize = 256 * 1024 * 1024;
 
+/// FNV-1a 64-bit over raw bytes — deterministic across runs and toolchains
+/// (unlike std's SipHash), used to key image dedup on pixel content.
+pub fn rgba_hash(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
 /// Encode raw RGBA8 pixels as PNG bytes.
 pub fn encode_rgba_png(w: u32, h: u32, rgba: &[u8]) -> io::Result<Vec<u8>> {
     let expected = (w as usize)
@@ -61,6 +72,16 @@ mod tests {
     fn mismatched_buffer_and_garbage_are_errors() {
         assert!(encode_rgba_png(2, 2, &[0u8; 3]).is_err());
         assert!(decode_png(b"not a png").is_err());
+    }
+
+    #[test]
+    fn rgba_hash_is_deterministic_and_input_sensitive() {
+        assert_eq!(rgba_hash(b""), 0xcbf2_9ce4_8422_2325, "FNV-1a offset basis for empty input");
+        let a = [1u8, 2, 3, 4];
+        assert_eq!(rgba_hash(&a), rgba_hash(&a), "same input, same hash");
+        let mut b = a;
+        b[2] ^= 1;
+        assert_ne!(rgba_hash(&a), rgba_hash(&b), "single-byte difference changes the hash");
     }
 
     #[test]

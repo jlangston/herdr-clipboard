@@ -120,10 +120,17 @@ fn poll_clipboard(store: HistoryStore, poll: Duration) {
         // get_image errors mean "clipboard isn't an image right now" — skip.
         if let Ok(image) = clipboard.get_image() {
             if last_img.as_deref() != Some(image.bytes.as_ref()) {
+                let hash = crate::img::rgba_hash(&image.bytes);
                 if let Ok(png) =
                     crate::img::encode_rgba_png(image.width as u32, image.height as u32, &image.bytes)
                 {
-                    let _ = store.append_image(&png, image.width as u32, image.height as u32, now_ms());
+                    let _ = store.append_image(
+                        &png,
+                        image.width as u32,
+                        image.height as u32,
+                        hash,
+                        now_ms(),
+                    );
                 }
                 last_img = Some(image.bytes.into_owned());
             }

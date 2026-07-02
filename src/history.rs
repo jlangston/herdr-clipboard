@@ -18,6 +18,10 @@ pub struct Entry {
     pub content: Content,
 }
 
+/// Newest row's image-dedup key: (kind, img_w, img_h, img_hash) — the
+/// image columns are NULL when the newest entry is text.
+type NewestImageKey = (String, Option<u32>, Option<u32>, Option<i64>);
+
 /// SQLite-backed clipboard history (WAL mode). Concurrency between the
 /// watcher (appends) and picker (deletes/reads) is handled by SQLite's
 /// single-writer locking plus a busy timeout — no external file lock.
@@ -51,16 +55,17 @@ impl HistoryStore {
         conn.pragma_update(None, "journal_mode", "WAL").map_err(io::Error::other)?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS entries (
-                id    INTEGER PRIMARY KEY,
-                ts    INTEGER NOT NULL,
-                kind  TEXT NOT NULL,
-                text  TEXT,
-                img   BLOB,
-                img_w INTEGER,
-                img_h INTEGER,
+                id       INTEGER PRIMARY KEY,
+                ts       INTEGER NOT NULL,
+                kind     TEXT NOT NULL,
+                text     TEXT,
+                img      BLOB,
+                img_w    INTEGER,
+                img_h    INTEGER,
+                img_hash INTEGER,
                 CHECK (
                     (kind = 'text' AND text IS NOT NULL AND img IS NULL)
-                    OR (kind = 'image' AND img IS NOT NULL AND text IS NULL)
+                    OR (kind = 'image' AND img IS NOT NULL AND img_hash IS NOT NULL AND text IS NULL)
                 )
             );",
         )
@@ -152,28 +157,36 @@ impl HistoryStore {
     }
 
     /// Store a PNG image as the newest entry; same skip/dedup semantics as
-    /// text, keyed on the encoded bytes.
-    pub fn append_image(&self, png: &[u8], w: u32, h: u32, ts: u64) -> io::Result<bool> {
+    /// text, keyed on the pixel content (dimensions + RGBA hash) rather
+    /// than the encoded bytes — a restore roundtrip that re-encodes the
+    /// same pixels differently must still dedup.
+    pub fn append_image(&self, png: &[u8], w: u32, h: u32, rgba_hash: u64, ts: u64) -> io::Result<bool> {
         if png.is_empty() || png.len() > self.max_image_bytes {
             return Ok(false);
         }
         let tx = self.conn.unchecked_transaction().map_err(io::Error::other)?;
-        let newest: Option<(String, Option<Vec<u8>>)> = tx
+        let newest: Option<NewestImageKey> = tx
             .query_row(
-                "SELECT kind, img FROM entries ORDER BY id DESC LIMIT 1",
+                "SELECT kind, img_w, img_h, img_hash FROM entries ORDER BY id DESC LIMIT 1",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()
             .map_err(io::Error::other)?;
-        if matches!(&newest, Some((k, Some(b))) if k == "image" && b == png) {
+        if matches!(&newest, Some((k, Some(nw), Some(nh), Some(nhash)))
+            if k == "image" && *nw == w && *nh == h && *nhash == rgba_hash as i64)
+        {
             return Ok(false);
         }
-        tx.execute("DELETE FROM entries WHERE kind = 'image' AND img = ?1", params![png])
-            .map_err(io::Error::other)?;
         tx.execute(
-            "INSERT INTO entries (ts, kind, img, img_w, img_h) VALUES (?1, 'image', ?2, ?3, ?4)",
-            params![ts as i64, png, w, h],
+            "DELETE FROM entries WHERE kind = 'image' AND img_w = ?1 AND img_h = ?2 AND img_hash = ?3",
+            params![w, h, rgba_hash as i64],
+        )
+        .map_err(io::Error::other)?;
+        tx.execute(
+            "INSERT INTO entries (ts, kind, img, img_w, img_h, img_hash)
+             VALUES (?1, 'image', ?2, ?3, ?4, ?5)",
+            params![ts as i64, png, w, h, rgba_hash as i64],
         )
         .map_err(io::Error::other)?;
         Self::enforce_cap(&tx, self.max_entries)?;
@@ -385,7 +398,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         let png = vec![1u8, 2, 3, 4, 5];
-        assert!(s.append_image(&png, 10, 20, 7).unwrap());
+        assert!(s.append_image(&png, 10, 20, crate::img::rgba_hash(&png), 7).unwrap());
         let entries = s.load();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].content, Content::Image { w: 10, h: 20, bytes: 5 });
@@ -398,16 +411,29 @@ mod tests {
     fn image_dedup_and_oversize_mirror_text_semantics() {
         let dir = tempfile::tempdir().unwrap();
         let s = HistoryStore::new(dir.path(), 50, 1024, 4).unwrap();
-        assert!(!s.append_image(&[0; 5], 1, 1, 1).unwrap()); // 5 bytes > 4
-        assert!(!s.append_image(&[], 1, 1, 1).unwrap());
-        assert!(s.append_image(&[1, 2, 3], 1, 1, 2).unwrap());
-        assert!(!s.append_image(&[1, 2, 3], 1, 1, 3).unwrap()); // identical to newest
+        assert!(!s.append_image(&[0; 5], 1, 1, 11, 1).unwrap()); // 5 bytes > 4
+        assert!(!s.append_image(&[], 1, 1, 12, 1).unwrap());
+        assert!(s.append_image(&[1, 2, 3], 1, 1, 42, 2).unwrap());
+        assert!(!s.append_image(&[1, 2, 3], 1, 1, 42, 3).unwrap()); // identical to newest
         assert_eq!(s.load()[0].ts, 2);
         s.append_text("interleaved", 4).unwrap();
-        assert!(s.append_image(&[1, 2, 3], 1, 1, 5).unwrap()); // move-to-front
+        assert!(s.append_image(&[1, 2, 3], 1, 1, 42, 5).unwrap()); // move-to-front
         assert_eq!(s.load().len(), 2);
         assert_eq!(s.load()[0].content, Content::Image { w: 1, h: 1, bytes: 3 });
         assert_eq!(s.load()[0].ts, 5);
+    }
+
+    #[test]
+    fn image_dedup_keys_on_pixels_not_encoding() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        // Two different encodings of the "same pixels" (same dims + hash):
+        assert!(s.append_image(&[1, 2, 3], 4, 4, 42, 1).unwrap());
+        assert!(!s.append_image(&[9, 9, 9, 9], 4, 4, 42, 2).unwrap(), "same pixels, different bytes: skip");
+        assert_eq!(s.load().len(), 1);
+        // Same dims, different pixels: distinct entry
+        assert!(s.append_image(&[1, 2, 3], 4, 4, 43, 3).unwrap());
+        assert_eq!(s.load().len(), 2);
     }
 
     #[test]
@@ -415,7 +441,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = HistoryStore::new(dir.path(), 2, 1024, 1024).unwrap();
         s.append_text("old", 1).unwrap();
-        s.append_image(&[9], 1, 1, 2).unwrap();
+        s.append_image(&[9], 1, 1, 9, 2).unwrap();
         s.append_text("new", 3).unwrap();
         assert_eq!(s.load().len(), 2);
         assert_eq!(texts(&s), vec!["new", "<image>"]);
