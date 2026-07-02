@@ -72,6 +72,15 @@ impl HistoryStore {
         fs::rename(&tmp, &self.path)
     }
 
+    /// Remove the entry with this timestamp. Texts are unique after dedup,
+    /// so ts is a sufficient identifier.
+    pub fn delete(&self, ts: u64) -> std::io::Result<()> {
+        let _lock = self.lock()?;
+        let mut entries = self.load();
+        entries.retain(|e| e.ts != ts);
+        self.write_all(&entries)
+    }
+
     /// Exclusive advisory lock; released when the returned File drops.
     fn lock(&self) -> std::io::Result<File> {
         let f = OpenOptions::new().create(true).write(true).open(&self.lock_path)?;
@@ -156,5 +165,31 @@ mod tests {
         assert!(!s.append("12345678901", 2).unwrap()); // 11 bytes > 10
         assert!(s.append("1234567890", 3).unwrap()); // exactly 10 is fine
         assert_eq!(s.load().len(), 1);
+    }
+
+    #[test]
+    fn delete_removes_entry_by_ts() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.append("keep", 1).unwrap();
+        s.append("drop", 2).unwrap();
+        s.delete(2).unwrap();
+        let entries = s.load();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].text, "keep");
+    }
+
+    #[test]
+    fn corrupt_lines_are_skipped_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.append("good", 1).unwrap();
+        let path = dir.path().join("history.jsonl");
+        let mut raw = std::fs::read_to_string(&path).unwrap();
+        raw.push_str("{not json\n");
+        raw.push_str("{\"ts\":2,\"text\":\"also good\"}\n");
+        std::fs::write(&path, raw).unwrap();
+        let texts: Vec<_> = s.load().iter().map(|e| e.text.clone()).collect();
+        assert_eq!(texts, vec!["also good", "good"]);
     }
 }
