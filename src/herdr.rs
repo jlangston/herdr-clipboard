@@ -86,8 +86,15 @@ pub fn find_focused_pane(result: &Value) -> Option<String> {
 }
 
 /// Pull a pane id out of a `pane.focused` event, tolerating several shapes.
+/// herdr 0.7 wraps the payload in `data` and uses `pane_id`, e.g.
+/// `{"event":"pane_focused","data":{"type":"pane_focused","pane_id":"w9:p1",...}}`;
+/// the earlier top-level shapes are kept for forward/backward tolerance.
 pub fn event_pane_id(event: &Value) -> Option<String> {
+    let data = event.get("data");
     [
+        data.and_then(|d| d.get("pane_id")),
+        data.and_then(|d| d.get("pane")).and_then(|p| p.get("pane_id")),
+        data.and_then(|d| d.get("pane")).and_then(|p| p.get("id")),
         event.get("pane_id"),
         event.get("pane").and_then(|p| p.get("id")),
         event.get("event").and_then(|e| e.get("pane_id")),
@@ -166,6 +173,14 @@ mod tests {
 
         let none = json!({"panes": [{"id": "w1:p1", "focused": false}]});
         assert_eq!(find_focused_pane(&none), None);
+
+        // Real herdr 0.7.1 pane.list result: {"type":"pane_list","panes":[PaneInfo]}
+        // where PaneInfo uses `pane_id` + `focused`.
+        let real = json!({"type": "pane_list", "panes": [
+            {"pane_id": "w2:p1", "focused": false, "workspace_id": "w2"},
+            {"pane_id": "w2:p5", "focused": true, "workspace_id": "w2"},
+        ]});
+        assert_eq!(find_focused_pane(&real), Some("w2:p5".into()));
     }
 
     #[test]
@@ -174,5 +189,23 @@ mod tests {
         assert_eq!(event_pane_id(&json!({"pane": {"id": "b"}})), Some("b".into()));
         assert_eq!(event_pane_id(&json!({"event": {"pane_id": "c"}})), Some("c".into()));
         assert_eq!(event_pane_id(&json!({"type": "workspace.created"})), None);
+    }
+
+    #[test]
+    fn event_pane_id_accepts_herdr_0_7_shapes() {
+        // Captured from herdr 0.7.1: the id is nested under `data`, and the
+        // top-level `event` is a bare string, not an object.
+        let focused = json!({
+            "event": "pane_focused",
+            "data": {"type": "pane_focused", "pane_id": "w9:p1", "workspace_id": "w9"}
+        });
+        assert_eq!(event_pane_id(&focused), Some("w9:p1".into()));
+
+        // pane.created wraps a PaneInfo (pane_id, not id) under data.pane.
+        let created = json!({
+            "event": "pane_created",
+            "data": {"type": "pane_created", "pane": {"pane_id": "w9:p2", "workspace_id": "w9"}}
+        });
+        assert_eq!(event_pane_id(&created), Some("w9:p2".into()));
     }
 }
