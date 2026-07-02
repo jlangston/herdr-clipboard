@@ -129,6 +129,45 @@ impl HistoryStore {
         Ok(true)
     }
 
+    /// Store a PNG image as the newest entry; same skip/dedup semantics as
+    /// text, keyed on the encoded bytes.
+    pub fn append_image(&self, png: &[u8], w: u32, h: u32, ts: u64) -> io::Result<bool> {
+        if png.is_empty() || png.len() > self.max_image_bytes {
+            return Ok(false);
+        }
+        let tx = self.conn.unchecked_transaction().map_err(io::Error::other)?;
+        let newest: Option<(String, Option<Vec<u8>>)> = tx
+            .query_row(
+                "SELECT kind, img FROM entries ORDER BY ts DESC, id DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(io::Error::other)?;
+        if matches!(&newest, Some((k, Some(b))) if k == "image" && b == png) {
+            return Ok(false);
+        }
+        tx.execute("DELETE FROM entries WHERE kind = 'image' AND img = ?1", params![png])
+            .map_err(io::Error::other)?;
+        tx.execute(
+            "INSERT INTO entries (ts, kind, img, img_w, img_h) VALUES (?1, 'image', ?2, ?3, ?4)",
+            params![ts as i64, png, w, h],
+        )
+        .map_err(io::Error::other)?;
+        Self::enforce_cap(&tx, self.max_entries)?;
+        tx.commit().map_err(io::Error::other)?;
+        Ok(true)
+    }
+
+    /// PNG bytes for an image entry; None if the id is gone or not an image.
+    pub fn get_image(&self, id: i64) -> io::Result<Option<Vec<u8>>> {
+        self.conn
+            .query_row("SELECT img FROM entries WHERE id = ?1", params![id], |r| r.get(0))
+            .optional()
+            .map_err(io::Error::other)
+            .map(Option::flatten)
+    }
+
     pub fn delete(&self, id: i64) -> io::Result<()> {
         self.conn
             .execute("DELETE FROM entries WHERE id = ?1", params![id])
@@ -252,5 +291,46 @@ mod tests {
         s.append_text("first", 100).unwrap();
         s.append_text("second", 50).unwrap(); // clock went backwards
         assert_eq!(texts(&s), vec!["second", "first"]);
+    }
+
+    #[test]
+    fn image_roundtrip_metadata_and_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let png = vec![1u8, 2, 3, 4, 5];
+        assert!(s.append_image(&png, 10, 20, 7).unwrap());
+        let entries = s.load();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].content, Content::Image { w: 10, h: 20, bytes: 5 });
+        assert_eq!(entries[0].ts, 7);
+        assert_eq!(s.get_image(entries[0].id).unwrap(), Some(png));
+        assert_eq!(s.get_image(9999).unwrap(), None);
+    }
+
+    #[test]
+    fn image_dedup_and_oversize_mirror_text_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = HistoryStore::new(dir.path(), 50, 1024, 4).unwrap();
+        assert!(!s.append_image(&[0; 5], 1, 1, 1).unwrap()); // 5 bytes > 4
+        assert!(!s.append_image(&[], 1, 1, 1).unwrap());
+        assert!(s.append_image(&[1, 2, 3], 1, 1, 2).unwrap());
+        assert!(!s.append_image(&[1, 2, 3], 1, 1, 3).unwrap()); // identical to newest
+        assert_eq!(s.load()[0].ts, 2);
+        s.append_text("interleaved", 4).unwrap();
+        assert!(s.append_image(&[1, 2, 3], 1, 1, 5).unwrap()); // move-to-front
+        assert_eq!(s.load().len(), 2);
+        assert_eq!(s.load()[0].content, Content::Image { w: 1, h: 1, bytes: 3 });
+        assert_eq!(s.load()[0].ts, 5);
+    }
+
+    #[test]
+    fn text_and_images_share_the_entry_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = HistoryStore::new(dir.path(), 2, 1024, 1024).unwrap();
+        s.append_text("old", 1).unwrap();
+        s.append_image(&[9], 1, 1, 2).unwrap();
+        s.append_text("new", 3).unwrap();
+        assert_eq!(s.load().len(), 2);
+        assert_eq!(texts(&s), vec!["new", "<image>"]);
     }
 }
