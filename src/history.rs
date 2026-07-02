@@ -110,7 +110,7 @@ impl HistoryStore {
         let tx = self.conn.unchecked_transaction().map_err(io::Error::other)?;
         let newest: Option<(String, Option<String>)> = tx
             .query_row(
-                "SELECT kind, text FROM entries ORDER BY ts DESC, id DESC LIMIT 1",
+                "SELECT kind, text FROM entries ORDER BY id DESC LIMIT 1",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -140,7 +140,7 @@ impl HistoryStore {
         let tx = self.conn.unchecked_transaction().map_err(io::Error::other)?;
         let newest: Option<(String, Option<Vec<u8>>)> = tx
             .query_row(
-                "SELECT kind, img FROM entries ORDER BY ts DESC, id DESC LIMIT 1",
+                "SELECT kind, img FROM entries ORDER BY id DESC LIMIT 1",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -319,6 +319,16 @@ mod tests {
         s.append_text("first", 100).unwrap();
         s.append_text("second", 50).unwrap(); // clock went backwards
         assert_eq!(texts(&s), vec!["second", "first"]);
+    }
+
+    #[test]
+    fn identical_to_front_is_skipped_even_under_clock_skew() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.append_text("a", 100).unwrap();
+        s.append_text("b", 50).unwrap(); // clock went backwards; b is front by insertion
+        assert!(!s.append_text("b", 60).unwrap(), "front entry re-copy must be a no-op");
+        assert_eq!(s.load()[0].ts, 50, "skip must not touch the timestamp");
     }
 
     #[test]
