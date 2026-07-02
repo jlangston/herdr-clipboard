@@ -119,7 +119,7 @@ pub fn paste_text(text: &str) -> String {
 /// One-line list preview: whitespace runs flattened, char-boundary-safe
 /// truncation, `[NL]` badge for multiline entries.
 pub fn format_preview(text: &str, width: usize) -> String {
-    let lines = text.trim_end_matches('\n').lines().count();
+    let lines = paste_text(text).lines().count();
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut out = if lines > 1 { format!("[{lines}L] {flat}") } else { flat };
     if out.chars().count() > width {
@@ -235,5 +235,24 @@ mod tests {
         assert_eq!(format_preview("a\n  b\tc\n", 80), "[2L] a b c");
         assert_eq!(format_preview("abcdef", 5), "abcd…");
         assert_eq!(format_preview("   \n", 80), "(whitespace)");
+    }
+
+    #[test]
+    fn preview_badge_matches_confirm_line_count() {
+        // paste_text("a\nb\n\n\n") == "a\nb\n\n" == 3 lines; badge must agree
+        assert_eq!(format_preview("a\nb\n\n\n", 80), "[3L] a b");
+    }
+
+    #[test]
+    fn keys_are_noops_when_filter_matches_nothing() {
+        let mut s = PickerState::new(vec![Entry { ts: 1, text: "hello".into() }]);
+        for c in "zzz".chars() {
+            s.on_key(Key::Char(c));
+        }
+        assert!(s.visible().is_empty());
+        s.on_key(Key::Up);
+        s.on_key(Key::Down);
+        assert_eq!(s.on_key(Key::Enter), Outcome::Continue);
+        assert_eq!(s.on_key(Key::DeleteEntry), Outcome::Continue);
     }
 }
