@@ -1,12 +1,15 @@
 id = "jlangston.multi-clipboard"
 name = "Multi Clipboard"
-version = "0.2.0"
+version = "0.3.0"
 min_herdr_version = "0.7.0"
 description = "tmux-style clipboard history picker with image support (prefix+plus)"
 platforms = ["linux", "macos"]
 
+# Fetches the prebuilt release binary matching `version` above
+# (checksum-verified); falls back to `cargo build --release` when no usable
+# asset exists (unsupported platform, no curl, offline, ...).
 [[build]]
-command = ["cargo", "build", "--release"]
+command = ["sh", "scripts/plugin-build.sh"]
 
 # The `./` prefix is required: herdr resolves plugin-pane commands via a PATH
 # lookup and rejects a bare relative path ("No viable candidates found in

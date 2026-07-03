@@ -11,8 +11,10 @@ image puts it back on the system clipboard instead.
 
 ## Install
 
-Requires herdr ≥ 0.7.0 and a Rust toolchain (the install step builds from
-source with `cargo build --release`).
+Requires herdr ≥ 0.7.0. No Rust toolchain needed on common platforms — the
+install step downloads a checksum-verified prebuilt binary (Linux
+x86_64/aarch64, macOS arm64/x86_64; needs `curl` and `tar`) and falls back
+to `cargo build --release` everywhere else.
 
 ```bash
 herdr plugin install jlangston/herdr-clipboard
