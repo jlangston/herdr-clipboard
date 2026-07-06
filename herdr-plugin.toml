@@ -56,3 +56,10 @@ command = ["./target/release/herdr-clip", "watch"]
 # interior newlines are interpreted as Enter, so every line but the last is
 # executed on arrival — which is exactly why the picker requires a second Enter
 # to confirm a multiline paste.
+
+# Requires herdr with the clipboard.copied event (patched build / future
+# release). On stock herdr 0.7.1 this hook never fires (the event does not
+# exist); verify link-compatibility before shipping to stock users.
+[[events]]
+on = "clipboard.copied"
+command = ["./target/release/herdr-clip", "save-copied"]

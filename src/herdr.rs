@@ -105,6 +105,21 @@ pub fn event_pane_id(event: &Value) -> Option<String> {
     .map(str::to_string)
 }
 
+/// Copied text from a clipboard.copied event envelope, tolerating several
+/// shapes ("data.text", top-level "text"). The exact serialization herdr
+/// will ship isn't final, so this mirrors `event_pane_id`'s defensiveness:
+/// try the nested shape first, then fall back to a bare top-level field.
+/// Missing, non-string, or empty text all yield `None`.
+pub fn event_copied_text(event: &Value) -> Option<String> {
+    let data = event.get("data");
+    [data.and_then(|d| d.get("text")), event.get("text")]
+        .into_iter()
+        .flatten()
+        .find_map(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,5 +222,31 @@ mod tests {
             "data": {"type": "pane_created", "pane": {"pane_id": "w9:p2", "workspace_id": "w9"}}
         });
         assert_eq!(event_pane_id(&created), Some("w9:p2".into()));
+    }
+
+    #[test]
+    fn event_copied_text_accepts_known_shapes() {
+        let full = json!({
+            "event": "clipboard.copied",
+            "data": {"text": "hello", "truncated": false}
+        });
+        assert_eq!(event_copied_text(&full), Some("hello".into()));
+
+        let data_only = json!({"data": {"text": "world"}});
+        assert_eq!(event_copied_text(&data_only), Some("world".into()));
+
+        let top_level = json!({"text": "flat"});
+        assert_eq!(event_copied_text(&top_level), Some("flat".into()));
+    }
+
+    #[test]
+    fn event_copied_text_rejects_missing_or_invalid_text() {
+        assert_eq!(event_copied_text(&json!({})), None);
+        assert_eq!(event_copied_text(&json!({"data": {}})), None);
+        assert_eq!(event_copied_text(&json!({"data": {"text": ""}})), None);
+        assert_eq!(event_copied_text(&json!({"text": ""})), None);
+        assert_eq!(event_copied_text(&json!({"data": {"text": 42}})), None);
+        assert_eq!(event_copied_text(&json!({"text": 42})), None);
+        assert_eq!(event_copied_text(&json!({"data": {"truncated": true}})), None);
     }
 }
