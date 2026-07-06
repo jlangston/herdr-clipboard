@@ -106,10 +106,11 @@ pub fn event_pane_id(event: &Value) -> Option<String> {
 }
 
 /// Copied text from a clipboard.copied event envelope, tolerating several
-/// shapes ("data.text", top-level "text"). The exact serialization herdr
-/// will ship isn't final, so this mirrors `event_pane_id`'s defensiveness:
-/// try the nested shape first, then fall back to a bare top-level field.
-/// Missing, non-string, or empty text all yield `None`.
+/// shapes ("data.text", top-level "text"). Verified against a patched herdr
+/// (clipboard-copied-event branch): the real hook envelope is
+/// `{"event":"clipboard_copied","data":{"type":"clipboard_copied","text":…}}`
+/// — `data.text` is the live path; the fallbacks stay for forward
+/// compatibility. Missing, non-string, or empty text all yield `None`.
 pub fn event_copied_text(event: &Value) -> Option<String> {
     let data = event.get("data");
     [data.and_then(|d| d.get("text")), event.get("text")]
@@ -226,11 +227,20 @@ mod tests {
 
     #[test]
     fn event_copied_text_accepts_known_shapes() {
+        // Captured verbatim from a patched herdr (clipboard-copied-event,
+        // c137acc): hook-side HERDR_PLUGIN_EVENT_JSON. `truncated` is
+        // omitted entirely when false and only present on >64 KiB copies.
         let full = json!({
-            "event": "clipboard.copied",
-            "data": {"text": "hello", "truncated": false}
+            "event": "clipboard_copied",
+            "data": {"type": "clipboard_copied", "text": "hello"}
         });
         assert_eq!(event_copied_text(&full), Some("hello".into()));
+
+        let truncated = json!({
+            "event": "clipboard_copied",
+            "data": {"type": "clipboard_copied", "text": "hel", "truncated": true}
+        });
+        assert_eq!(event_copied_text(&truncated), Some("hel".into()));
 
         let data_only = json!({"data": {"text": "world"}});
         assert_eq!(event_copied_text(&data_only), Some("world".into()));
