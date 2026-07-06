@@ -8,7 +8,24 @@ permissions:
   contents: write
 
 jobs:
+  # Releases are gated on the test suite: nothing builds or publishes if
+  # tests or lints fail on the tagged commit.
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test
+        run: cargo test --locked
+      - name: Clippy
+        if: matrix.os == 'ubuntu-22.04'
+        run: cargo clippy --all-targets --locked -- -D warnings
+
   build:
+    needs: test
     strategy:
       fail-fast: false
       matrix:

@@ -1,0 +1,21 @@
+name: ci
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test
+        run: cargo test --locked
+      - name: Clippy
+        if: matrix.os == 'ubuntu-22.04'
+        run: cargo clippy --all-targets --locked -- -D warnings
