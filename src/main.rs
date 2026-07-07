@@ -70,9 +70,10 @@ fn cmd_list() {
 /// empty output with exit 0: paste must never error into the caller.
 fn cmd_latest() {
     // A read-only paste must not create the state dir / an empty db as a
-    // side effect, which opening the store would do.
+    // side effect, which opening the store would do. A legacy history.jsonl
+    // counts as existing state: opening migrates it, same as list/pick.
     let state_dir = paths::state_dir();
-    if !state_dir.join("history.db").exists() {
+    if !state_dir.join("history.db").exists() && !state_dir.join("history.jsonl").exists() {
         return;
     }
     let cfg = config::Config::load(paths::config_dir().as_deref());
