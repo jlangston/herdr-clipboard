@@ -1,7 +1,7 @@
 # Keep in sync with STATE_FALLBACK_REL in src/paths.rs (plain-shell state-dir fallback).
 id = "jlangston.multi-clipboard"
 name = "Multi Clipboard"
-version = "0.3.0"
+version = "0.4.0"
 min_herdr_version = "0.7.0"
 description = "tmux-style clipboard history picker with image support (prefix+plus)"
 platforms = ["linux", "macos"]
