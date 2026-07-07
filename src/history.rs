@@ -111,6 +111,16 @@ impl HistoryStore {
         }
     }
 
+    /// Newest text entry's content, skipping image entries; None when the
+    /// history holds no text. This is the paste source for editors inside
+    /// herdr panes (`herdr-clip latest`).
+    pub fn newest_text(&self) -> Option<String> {
+        self.load().into_iter().find_map(|e| match e.content {
+            Content::Text(t) => Some(t),
+            Content::Image { .. } => None,
+        })
+    }
+
     /// Store text as the newest entry. Returns false when skipped
     /// (empty, oversized, or identical to the current newest entry).
     pub fn append_text(&self, text: &str, ts: u64) -> io::Result<bool> {
@@ -504,5 +514,24 @@ mod tests {
         let s = HistoryStore::new(dir.path(), 500, 1024, 1024).unwrap();
         assert_eq!(s.load().len(), 200);
         assert!(!dir.path().join("history.jsonl").exists());
+    }
+
+    #[test]
+    fn newest_text_skips_images_and_prefers_newest() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        assert_eq!(s.newest_text(), None);
+        s.append_text("older", 1).unwrap();
+        s.append_text("newer", 2).unwrap();
+        s.append_image(&[1, 2, 3], 1, 1, 42, 3).unwrap();
+        assert_eq!(s.newest_text(), Some("newer".into()));
+    }
+
+    #[test]
+    fn newest_text_none_when_only_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.append_image(&[1, 2, 3], 1, 1, 42, 1).unwrap();
+        assert_eq!(s.newest_text(), None);
     }
 }
