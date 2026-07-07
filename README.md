@@ -93,6 +93,8 @@ poll_ms = 500               # clipboard poll interval
   `serve-clipboard.log` in the state dir.
 - `herdr-clip list` (the plugin binary, in `target/release/`) dumps history
   as TSV for scripting.
+- `herdr-clip latest` prints the newest text entry raw — the paste backend
+  for editors inside herdr panes (nvim's `+` register reads it).
 
 ## Caveats
 

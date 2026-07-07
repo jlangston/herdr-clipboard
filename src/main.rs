@@ -21,6 +21,7 @@ fn main() {
             }
         }
         Some("list") => cmd_list(),
+        Some("latest") => cmd_latest(),
         Some("save-copied") => cmd_save_copied(),
         Some("serve-clipboard") => {
             let id = args.get(1).and_then(|s| s.parse::<i64>().ok());
@@ -38,7 +39,7 @@ fn main() {
             }
         }
         _ => {
-            eprintln!("usage: herdr-clip <watch|pick|list>");
+            eprintln!("usage: herdr-clip <watch|pick|list|latest>");
             std::process::exit(2);
         }
     }
@@ -60,6 +61,36 @@ fn cmd_list() {
     };
     for (i, e) in store.load().iter().enumerate() {
         println!("{i}\t{}\t{}", e.ts, picker::entry_label(e, 100));
+    }
+}
+
+/// `herdr-clip latest`: newest text entry raw on stdout — the paste backend
+/// for editors inside herdr panes (herdr drops OSC 52 queries, so paste
+/// cannot go through the terminal). Empty history or store errors produce
+/// empty output with exit 0: paste must never error into the caller.
+fn cmd_latest() {
+    // A read-only paste must not create the state dir / an empty db as a
+    // side effect, which opening the store would do.
+    let state_dir = paths::state_dir();
+    if !state_dir.join("history.db").exists() {
+        return;
+    }
+    let cfg = config::Config::load(paths::config_dir().as_deref());
+    let store = match history::HistoryStore::new(
+        &state_dir,
+        cfg.max_entries,
+        cfg.max_entry_bytes,
+        cfg.max_image_bytes,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("herdr-clip latest: {e}");
+            return;
+        }
+    };
+    if let Some(text) = store.newest_text() {
+        use std::io::Write;
+        let _ = std::io::stdout().write_all(text.as_bytes());
     }
 }
 
