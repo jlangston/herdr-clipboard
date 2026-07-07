@@ -1,3 +1,4 @@
+# Keep in sync with STATE_FALLBACK_REL in src/paths.rs (plain-shell state-dir fallback).
 id = "jlangston.multi-clipboard"
 name = "Multi Clipboard"
 version = "0.3.0"
